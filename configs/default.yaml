@@ -1,0 +1,31 @@
+# Example hyperparameters
+env_name: "CartPole-v1"
+obs_dim: 4
+action_dim: 2                # discrete
+discrete_actions: true
+
+seq_length: 50
+batch_size: 16
+imagination_horizon: 15
+
+# Dreamer training config
+gamma: 0.99
+lam: 0.95
+free_bits: 1.0
+
+# Learning rates
+lr_world: 1e-4
+lr_actor: 4e-5
+lr_critic: 4e-5
+
+# Replay
+buffer_capacity: 1000
+
+# Epsilon for discrete exploration (optional)
+epsilon: 0.05
+
+# Training steps
+train_steps: 100000
+
+# Others
+log_interval: 1000
