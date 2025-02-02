@@ -1,129 +1,174 @@
 # modules/utils.py
 
-import numpy as np
+import numpy as numpy
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from collections import deque
 
 
-# -------------------------------------------------------------------------
-#  Replay Buffer for Full Episodes (or partial) with sequence sampling
-# -------------------------------------------------------------------------
-class SequenceReplayBuffer:
+# --------------------------------------------------------------------------------
+#  Experience Replay Buffer for Sequence-Based Learning
+# --------------------------------------------------------------------------------
+class ExperienceSequenceBuffer:
     """
-    Stores full episodes in a list, then samples multi-step slices (seq_length)
-    for Dreamer-like RSSM training.
+    Stores complete episodes and samples fixed-length sequences for training recurrent models.
+    
+    Attributes:
+        capacity (int): Maximum number of episodes to store
+        sequence_length (int): Length of subsequences to sample
+        episodes (list): Circular buffer of stored episodes
+        current_position (int): Pointer to next storage position
     """
-    def __init__(self, capacity=1000, seq_length=50):
+    
+    def __init__(self, capacity=1000, sequence_length=50):
         self.capacity = capacity
-        self.seq_length = seq_length
-        self.buffer = []
-        self.position = 0
+        self.sequence_length = sequence_length
+        self.episodes = []
+        self.current_position = 0
 
-    def store_episode(self, ep_obs, ep_actions, ep_rewards, ep_dones):
+    def store_episode(self, observations, actions, rewards, dones):
         """
-        Store a complete episode in the buffer.
+        Stores a complete episode in the buffer.
+        
+        Args:
+            observations: Sequence of environment observations
+            actions: Sequence of agent actions
+            rewards: Sequence of environment rewards
+            dones: Sequence of episode termination flags
         """
-        episode = {
-            'obs': ep_obs,
-            'actions': ep_actions,
-            'rewards': ep_rewards,
-            'dones': ep_dones
+        episode_record = {
+            'observations': observations,
+            'actions': actions,
+            'rewards': rewards,
+            'dones': dones
         }
 
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(episode)
+        if len(self.episodes) < self.capacity:
+            self.episodes.append(episode_record)
         else:
-            self.buffer[self.position] = episode
-        self.position = (self.position + 1) % self.capacity
+            self.episodes[self.current_position] = episode_record
+        self.current_position = (self.current_position + 1) % self.capacity
 
-    def sample(self, batch_size):
+    def sample_sequences(self, batch_size):
         """
-        Sample a batch of episodes, then randomly pick a seq_length slice from each.
-        Returns: obs [B, L, obs_dim], actions [B, L, ...], rewards [B, L], dones [B, L]
+        Samples batch of fixed-length sequences from stored episodes.
+        
+        Returns:
+            observations: Tensor [batch_size, seq_len, obs_dim]
+            actions: Tensor [batch_size, seq_len, ...]
+            rewards: Tensor [batch_size, seq_len]
+            dones: Tensor [batch_size, seq_len]
         """
-        valid_episodes = [ep for ep in self.buffer if ep is not None]
-        episodes = np.random.choice(valid_episodes, size=batch_size)
+        valid_episodes = [ep for ep in self.episodes if ep is not None]
+        selected_episodes = numpy.random.choice(valid_episodes, size=batch_size)
 
-        obs_batch, act_batch, rew_batch, done_batch = [], [], [], []
-        for ep in episodes:
-            ep_len = len(ep['obs'])
-            # If ep_len < seq_length, just start at 0 or skip
-            if ep_len <= self.seq_length:
-                start_idx = 0
+        observation_sequences = []
+        action_sequences = []
+        reward_sequences = []
+        done_sequences = []
+
+        for episode in selected_episodes:
+            episode_length = len(episode['observations'])
+            
+            # Handle episodes shorter than required sequence length
+            if episode_length <= self.sequence_length:
+                start_index = 0
             else:
-                start_idx = np.random.randint(0, ep_len - self.seq_length)
+                start_index = numpy.random.randint(0, episode_length - self.sequence_length)
 
-            seq_obs = ep['obs'][start_idx : start_idx + self.seq_length]
-            seq_actions = ep['actions'][start_idx : start_idx + self.seq_length]
-            seq_rewards = ep['rewards'][start_idx : start_idx + self.seq_length]
-            seq_dones   = ep['dones'][start_idx : start_idx + self.seq_length]
+            # Extract sequence chunk
+            end_index = start_index + self.sequence_length
+            observation_sequences.append(episode['observations'][start_index:end_index])
+            action_sequences.append(episode['actions'][start_index:end_index])
+            reward_sequences.append(episode['rewards'][start_index:end_index])
+            done_sequences.append(episode['dones'][start_index:end_index])
 
-            obs_batch.append(seq_obs)
-            act_batch.append(seq_actions)
-            rew_batch.append(seq_rewards)
-            done_batch.append(seq_dones)
-
-        obs_batch = torch.FloatTensor(np.array(obs_batch))
-        act_batch = torch.FloatTensor(np.array(act_batch))
-        rew_batch = torch.FloatTensor(np.array(rew_batch))
-        done_batch= torch.FloatTensor(np.array(done_batch))
-
-        return obs_batch, act_batch, rew_batch, done_batch
+        # Convert to tensors with explicit type casting
+        return (
+            torch.as_tensor(numpy.array(observation_sequences), dtype=torch.float32),
+            torch.as_tensor(numpy.array(action_sequences), dtype=torch.float32),
+            torch.as_tensor(numpy.array(reward_sequences), dtype=torch.float32),
+            torch.as_tensor(numpy.array(done_sequences), dtype=torch.float32)
+        )
 
     def __len__(self):
-        return len([ep for ep in self.buffer if ep is not None])
+        """Returns current number of stored episodes."""
+        return len([ep for ep in self.episodes if ep is not None])
 
 
-# -------------------------------------------------------------------------
-#  Running Mean/Std for Return Normalization
-# -------------------------------------------------------------------------
-class RunningMeanStd:
+# --------------------------------------------------------------------------------
+#  Adaptive Normalization Statistics
+# --------------------------------------------------------------------------------
+class RunningStatisticsTracker:
+    """
+    Maintains and updates running statistics for data normalization.
+    
+    Attributes:
+        mean (float): Running mean
+        variance (float): Running variance
+        sample_count (int): Total number of processed samples
+        epsilon (float): Numerical stability constant
+    """
+    
     def __init__(self, epsilon=1e-5):
-        self.mean = 0
-        self.var = 1
-        self.count = 0
+        self.mean = 0.0
+        self.variance = 1.0
+        self.sample_count = 0
         self.epsilon = epsilon
 
-    def update(self, x: torch.Tensor):
-        batch_mean = x.mean()
-        batch_var = x.var()
-        batch_count = x.numel()
+    def update(self, data_batch: torch.Tensor):
+        """Updates statistics with new batch of data using Welford's algorithm."""
+        batch_mean = data_batch.mean().item()
+        batch_variance = data_batch.var().item()
+        batch_size = data_batch.numel()
 
-        total_count = self.count + batch_count
-        delta = batch_mean - self.mean
-        new_mean = self.mean + delta * batch_count / (total_count + 1e-8)
+        total_samples = self.sample_count + batch_size
+        mean_delta = batch_mean - self.mean
+        
+        # Update mean using combined average
+        combined_mean = self.mean + mean_delta * batch_size / total_samples
+        
+        # Update variance using combined sum of squares
+        combined_variance = (
+            (self.variance * self.sample_count) + 
+            (batch_variance * batch_size) + 
+            (mean_delta**2 * self.sample_count * batch_size) / total_samples
+        ) / total_samples
 
-        m_a = self.var * self.count
-        m_b = batch_var * batch_count
-        M2 = m_a + m_b + delta**2 * self.count * batch_count / (total_count + 1e-8)
-        new_var = M2 / (total_count + 1e-8)
+        self.mean = combined_mean
+        self.variance = combined_variance
+        self.sample_count = total_samples
 
-        self.mean, self.var, self.count = new_mean, new_var, total_count
+    def normalize(self, data: torch.Tensor):
+        """Applies z-score normalization using current statistics."""
+        return (data - self.mean) / torch.sqrt(torch.tensor(self.variance) + self.epsilon)
 
-    def normalize(self, x: torch.Tensor):
-        return (x - self.mean) / torch.sqrt(self.var + self.epsilon)
-
-    def denormalize(self, x: torch.Tensor):
-        return x * torch.sqrt(self.var + self.epsilon) + self.mean
+    def denormalize(self, normalized_data: torch.Tensor):
+        """Reverses normalization transformation."""
+        return normalized_data * torch.sqrt(torch.tensor(self.variance) + self.epsilon) + self.mean
 
 
-# -------------------------------------------------------------------------
-#  Symlog & Two-Hot
-# -------------------------------------------------------------------------
-def symlog(x):
-    """Symmetric log transform used in Dreamer."""
-    return torch.sign(x) * torch.log1p(torch.abs(x))
+# --------------------------------------------------------------------------------
+#  Value Transformation Utilities
+# --------------------------------------------------------------------------------
+def symmetric_logarithm_transform(values: torch.Tensor) -> torch.Tensor:
+    """Applies signed logarithmic transformation to preserve sign and compresses magnitude."""
+    return torch.sign(values) * torch.log1p(torch.abs(values))
 
-def symexp(x):
-    """Inverse of symlog."""
-    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
+def symmetric_exponential_transform(values: torch.Tensor) -> torch.Tensor:
+    """Inverts symmetric logarithm transformation."""
+    return torch.sign(values) * (torch.exp(torch.abs(values)) - 1.0)
 
-def twohot_encode(x, bins):
-    """Two-hot encoding for reward as used by Dreamer."""
-    # x: shape [B], bins: shape [num_bins]
-    distances = torch.abs(x.unsqueeze(-1) - bins)
-    # Typically scale distance to get sharp twohot, e.g. * 10
-    weights = torch.softmax(-distances * 10.0, dim=-1)
-    return weights
+def create_two_hot_distribution(values: torch.Tensor, bin_centers: torch.Tensor) -> torch.Tensor:
+    """
+    Creates soft two-hot distribution over predefined bins.
+    
+    Args:
+        values: Tensor of values to encode [batch_size]
+        bin_centers: Tensor of bin center positions [num_bins]
+        
+    Returns:
+        Tensor of probabilities over bins [batch_size, num_bins]
+    """
+    value_bin_distances = torch.abs(values.unsqueeze(-1) - bin_centers)
+    sharpness_factor = 10.0  # Controls distribution concentration
+    return torch.softmax(-value_bin_distances * sharpness_factor, dim=-1)

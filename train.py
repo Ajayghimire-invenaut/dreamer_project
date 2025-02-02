@@ -1,80 +1,176 @@
 # main.py
 
 import yaml
-import gym
+import gymnasium as gym
 import torch
-import numpy as np
+import numpy as numpy
+from typing import Dict, Any, Optional
 from modules.world_model import WorldModel
-from modules.agent import DreamerAgent
+from modules.agent import DreamerLearningAgent
 
-def run_training(config_path="configs/default.yaml"):
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
 
-    env_name = config["env_name"]
-    env = gym.make(env_name)
-    obs_dim = env.observation_space.shape[0]
+def execute_training_workflow(configuration_path: str = "configs/default.yaml") -> None:
+    """
+    Orchestrates the complete training process for the Dreamer agent.
     
-    # If discrete, e.g., CartPole, action_dim = env.action_space.n
-    # If continuous, e.g., MuJoCo, action_dim = env.action_space.shape[0]
-    if config.get("discrete_actions", True):
-        action_dim = env.action_space.n
-    else:
-        action_dim = env.action_space.shape[0]
-
-    # Create WorldModel
-    # You can set stoch_dim/deter_dim/hidden_dim from config if you want
-    world_model = WorldModel(
-        obs_dim=obs_dim,
-        action_dim=action_dim,
-        stoch_dim=32,
-        deter_dim=256,
-        hidden_dim=256,
-        free_bits=config.get("free_bits", 1.0)
+    Args:
+        configuration_path: Path to YAML configuration file
+    """
+    # Load training configuration
+    configuration = _load_training_configuration(configuration_path)
+    
+    # Initialize training environment
+    environment, observation_dimension, action_dimension = _setup_training_environment(
+        configuration["environment_name"],
+        configuration.get("discrete_actions", True)
     )
-
-    # DreamerAgent
-    agent = DreamerAgent(
+    
+    # Initialize world model components
+    world_model = _create_world_model(
+        observation_dimension=observation_dimension,
+        action_dimension=action_dimension,
+        configuration=configuration
+    )
+    
+    # Create learning agent
+    learning_agent = _initialize_learning_agent(
         world_model=world_model,
-        obs_dim=obs_dim,
-        action_dim=action_dim,
-        discrete_actions=config.get("discrete_actions", True),
-        seq_length=config.get("seq_length", 50),
-        buffer_capacity=config.get("buffer_capacity", 1000),
-        batch_size=config.get("batch_size", 16),
-        imagination_horizon=config.get("imagination_horizon", 15),
-        gamma=config.get("gamma", 0.99),
-        lam=config.get("lambda", 0.95),
-        free_bits=config.get("free_bits", 1.0),
-        wm_lr=config.get("wm_lr", 1e-4),
-        actor_lr=config.get("actor_lr", 4e-5),
-        critic_lr=config.get("critic_lr", 4e-5),
-        device="cpu"  # or 'cuda' if available
+        observation_dimension=observation_dimension,
+        action_dimension=action_dimension,
+        configuration=configuration
+    )
+    
+    # Execute main training sequence
+    _run_training_loop(
+        environment=environment,
+        learning_agent=learning_agent,
+        max_training_steps=configuration.get("max_training_steps", 100000),
+        training_start_delay=configuration.get("training_start_delay", 1000),
+        training_interval=configuration.get("training_interval", 50)
     )
 
-    obs = env.reset()
-    max_steps = config.get("max_steps", 100000)
-    episode_reward = 0
 
-    for step in range(max_steps):
-        action = agent.act(obs)
-        next_obs, reward, done, _ = env.step(action)
+def _load_training_configuration(config_path: str) -> Dict[str, Any]:
+    """Load and return training parameters from YAML file."""
+    try:
+        with open(config_path, "r") as config_file:
+            return yaml.safe_load(config_file)
+    except FileNotFoundError:
+        raise RuntimeError(f"Configuration file not found at {config_path}")
+    except yaml.YAMLError as e:
+        raise RuntimeError(f"Error parsing configuration file: {e}")
 
-        agent.store_transition(obs, action, reward, done)
-        obs = next_obs
-        episode_reward += reward
 
-        if done:
-            print(f"Episode finished. Total reward: {episode_reward}")
-            episode_reward = 0
-            obs = env.reset()
+def _setup_training_environment(
+    environment_name: str,
+    discrete_actions: bool
+) -> tuple[gym.Env, int, int]:
+    """Initialize and configure the training environment."""
+    try:
+        environment = gym.make(environment_name)
+    except gym.error.Error as e:
+        raise RuntimeError(f"Failed to create environment {environment_name}: {e}")
+    
+    # Validate action space configuration
+    if discrete_actions and not isinstance(environment.action_space, gym.spaces.Discrete):
+        raise ValueError("Discrete action configuration mismatch with environment's action space")
+    if not discrete_actions and not isinstance(environment.action_space, gym.spaces.Box):
+        raise ValueError("Continuous action configuration mismatch with environment's action space")
+    
+    observation_dimension = environment.observation_space.shape[0]
+    action_dimension = (
+        environment.action_space.n if discrete_actions 
+        else environment.action_space.shape[0]
+    )
+    
+    return environment, observation_dimension, action_dimension
 
-        # Periodically train
-        if step > 1000 and step % 50 == 0:
-            logs = agent.train()
-            if logs:
-                print(f"Step={step}, Logs={logs}")
+
+def _create_world_model(
+    observation_dimension: int,
+    action_dimension: int,
+    configuration: Dict[str, Any]
+) -> WorldModel:
+    """Instantiate and return the world model component."""
+    return WorldModel(
+        observation_dimension=observation_dimension,
+        action_dimension=action_dimension,
+        stochastic_dimension=configuration.get("stochastic_dimension", 32),
+        deterministic_dimension=configuration.get("deterministic_dimension", 256),
+        hidden_dimension=configuration.get("hidden_dimension", 256),
+        free_information_bits=configuration.get("free_information_bits", 1.0)
+    )
+
+
+def _initialize_learning_agent(
+    world_model: WorldModel,
+    observation_dimension: int,
+    action_dimension: int,
+    configuration: Dict[str, Any]
+) -> DreamerLearningAgent:
+    """Configure and return the Dreamer learning agent."""
+    computation_device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    return DreamerLearningAgent(
+        world_model=world_model,
+        observation_dimension=observation_dimension,
+        action_dimension=action_dimension,
+        discrete_actions=configuration.get("discrete_actions", True),
+        sequence_length=configuration.get("sequence_length", 50),
+        replay_capacity=configuration.get("replay_capacity", 1000),
+        training_batch_size=configuration.get("training_batch_size", 16),
+        imagination_depth=configuration.get("imagination_depth", 15),
+        discount_factor=configuration.get("discount_factor", 0.99),
+        gae_lambda=configuration.get("gae_lambda", 0.95),
+        free_information_bits=configuration.get("free_information_bits", 1.0),
+        world_model_learning_rate=configuration.get("world_model_learning_rate", 1e-4),
+        policy_learning_rate=configuration.get("policy_learning_rate", 4e-5),
+        value_learning_rate=configuration.get("value_learning_rate", 4e-5),
+        computation_device=computation_device
+    )
+
+
+def _run_training_loop(
+    environment: gym.Env,
+    learning_agent: DreamerLearningAgent,
+    max_training_steps: int,
+    training_start_delay: int,
+    training_interval: int
+) -> None:
+    """Execute the main training sequence with periodic updates."""
+    current_observation, _ = environment.reset()
+    episode_cumulative_reward = 0.0
+
+    for training_step in range(1, max_training_steps + 1):
+        # Agent interaction with environment
+        selected_action = learning_agent.select_action(current_observation)
+        next_observation, reward, terminated, truncated, _ = environment.step(selected_action)
+        
+        # Store experience and update state
+        learning_agent.record_experience(current_observation, selected_action, reward, terminated or truncated)
+        current_observation = next_observation
+        episode_cumulative_reward += reward
+
+        # Handle episode completion
+        if terminated or truncated:
+            print(f"Episode completed at step {training_step} | Total Reward: {episode_cumulative_reward:.2f}")
+            episode_cumulative_reward = 0.0
+            current_observation, _ = environment.reset()
+
+        # Perform training updates
+        if training_step > training_start_delay and training_step % training_interval == 0:
+            training_metrics = learning_agent.update_models()
+            if training_metrics:
+                print(f"Training Step: {training_step}")
+                for metric, value in training_metrics.items():
+                    print(f"  {metric.replace('_', ' ').title()}: {value:.4f}")
 
 
 if __name__ == "__main__":
-    run_training()
+    try:
+        execute_training_workflow()
+    except KeyboardInterrupt:
+        print("\nTraining process interrupted by user.")
+    except Exception as error:
+        print(f"Unexpected error occurred: {error}")
+        raise

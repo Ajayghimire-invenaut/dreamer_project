@@ -2,325 +2,381 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as torch_functional
 from torch.distributions import Normal, Independent
 from .utils import symlog, symexp, twohot_encode
 
 
 class Encoder(nn.Module):
-    """Simple MLP encoder for vector observations."""
-    def __init__(self, input_dim, hidden_dim=256):
+    """Multi-Layer Perceptron encoder for processing vector observations."""
+    def __init__(self, input_dimension, hidden_dimension=256):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+        self.network = nn.Sequential(
+            nn.Linear(input_dimension, hidden_dimension),
+            nn.LayerNorm(hidden_dimension),
             nn.ELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dimension, hidden_dimension),
+            nn.LayerNorm(hidden_dimension),
             nn.ELU()
         )
 
-    def forward(self, obs):
-        # Optionally apply symlog to obs if it spans large ranges
-        # obs = symlog(obs)
-        return self.net(obs)
+    def forward(self, observation):
+        return self.network(observation)
 
 
 class Decoder(nn.Module):
-    """Simple MLP decoder to reconstruct observations from latents."""
-    def __init__(self, feat_dim, output_dim, hidden_dim=256):
+    """Multi-Layer Perceptron decoder for reconstructing observations from latent features."""
+    def __init__(self, feature_dimension, output_dimension, hidden_dimension=256):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(feat_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+        self.network = nn.Sequential(
+            nn.Linear(feature_dimension, hidden_dimension),
+            nn.LayerNorm(hidden_dimension),
             nn.ELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dimension, hidden_dimension),
+            nn.LayerNorm(hidden_dimension),
             nn.ELU(),
-            nn.Linear(hidden_dim, output_dim)
+            nn.Linear(hidden_dimension, output_dimension)
         )
 
-    def forward(self, feat):
-        # Output is a direct reconstruction, or symexp if you used symlog
-        x = self.net(feat)
-        return x  # or symexp(x)
+    def forward(self, feature):
+        return self.network(feature)
 
 
-class GRURSSM(nn.Module):
+class GRURecurrentStateSpaceModel(nn.Module):
     """
-    GRU-based RSSM with a deterministic (GRU) state and a stochastic state
-    for each timestep.
+    Recurrent State Space Model with GRU-based deterministic path and stochastic latent variables.
+    Combines deterministic and stochastic components for temporal state transitions.
     """
-    def __init__(self, stoch_dim=32, deter_dim=256, hidden_dim=256, free_bits=1.0):
+    def __init__(self, stochastic_dimension=32, deterministic_dimension=256, 
+                 hidden_dimension=256, free_bits=1.0):
         super().__init__()
-        self.stoch_dim = stoch_dim
-        self.deter_dim = deter_dim
+        self.stochastic_dimension = stochastic_dimension
+        self.deterministic_dimension = deterministic_dimension
         self.free_bits = free_bits
 
-        # GRU for deterministic path
-        self.gru = nn.GRUCell(hidden_dim, deter_dim)
+        # Gated Recurrent Unit for deterministic state transitions
+        self.gated_recurrent_unit = nn.GRUCell(hidden_dimension, deterministic_dimension)
 
-        # Prior MLP
-        self.prior_net = nn.Sequential(
-            nn.Linear(deter_dim, hidden_dim),
+        # Prior network components
+        self.prior_network = nn.Sequential(
+            nn.Linear(deterministic_dimension, hidden_dimension),
             nn.ELU(),
-            nn.Linear(hidden_dim, 2 * stoch_dim)
+            nn.Linear(hidden_dimension, 2 * stochastic_dimension)
         )
 
-        # Posterior MLP
-        self.post_net = nn.Sequential(
-            nn.Linear(deter_dim + hidden_dim, hidden_dim),
+        # Posterior network components
+        self.posterior_network = nn.Sequential(
+            nn.Linear(deterministic_dimension + hidden_dimension, hidden_dimension),
             nn.ELU(),
-            nn.Linear(hidden_dim, 2 * stoch_dim)
+            nn.Linear(hidden_dimension, 2 * stochastic_dimension)
         )
 
-    def forward(self, prev_state, obs_emb, act_emb):
+    def forward(self, previous_state, encoded_observation, encoded_action):
         """
-        Single-step RSSM update.
+        Single-step state transition with KL divergence calculation.
         Args:
-          prev_state: dict with 'deter' [B, deter_dim], 'stoch' [B, stoch_dim]
-          obs_emb: [B, hidden_dim] from encoder
-          act_emb: [B, hidden_dim] from action
-        Returns: next_state, kl
+            previous_state: Dictionary containing:
+                - 'deterministic': [batch_size, deterministic_dimension]
+                - 'stochastic': [batch_size, stochastic_dimension]
+            encoded_observation: [batch_size, hidden_dimension] from encoder
+            encoded_action: [batch_size, hidden_dimension] from action embedding
+        Returns: Updated state dictionary and KL divergence
         """
-        x = obs_emb + act_emb
-        deter_state = self.gru(x, prev_state['deter'])
-
-        # prior
-        prior_params = self.prior_net(deter_state)
-        prior_mean, prior_std = torch.chunk(prior_params, 2, dim=-1)
-        prior_std = F.softplus(prior_std) + 0.1
-        prior_dist = Normal(prior_mean, prior_std)
-
-        # posterior
-        post_input = torch.cat([deter_state, obs_emb], dim=-1)
-        post_params = self.post_net(post_input)
-        post_mean, post_std = torch.chunk(post_params, 2, dim=-1)
-        post_std = F.softplus(post_std) + 0.1
-        post_dist = Normal(post_mean, post_std)
-
-        stoch_state = post_dist.rsample()
-
-        # KL with free bits
-        kl = torch.distributions.kl.kl_divergence(post_dist, prior_dist)
-        kl = torch.clamp(kl, min=self.free_bits).mean()
-
-        next_state = {
-            'deter': deter_state,
-            'stoch': stoch_state
-        }
-        return next_state, kl
-
-
-class RewardModel(nn.Module):
-    """Predict reward (using two-hot if desired)."""
-    def __init__(self, feat_dim, num_bins=255):
-        super().__init__()
-        self.num_bins = num_bins
-        self.bins = nn.Parameter(torch.linspace(-20, 20, num_bins), requires_grad=False)
-        self.net = nn.Sequential(
-            nn.Linear(feat_dim, 256),
-            nn.ELU(),
-            nn.Linear(256, num_bins)
+        combined_input = encoded_observation + encoded_action
+        deterministic_state = self.gated_recurrent_unit(
+            combined_input, previous_state['deterministic']
         )
 
-    def forward(self, feat):
-        logits = self.net(feat)
-        return logits
+        # Prior distribution calculations
+        prior_parameters = self.prior_network(deterministic_state)
+        prior_mean, prior_standard_deviation = torch.chunk(prior_parameters, 2, dim=-1)
+        prior_standard_deviation = torch_functional.softplus(prior_standard_deviation) + 0.1
+        prior_distribution = Normal(prior_mean, prior_standard_deviation)
+
+        # Posterior distribution calculations
+        posterior_input = torch.cat([deterministic_state, encoded_observation], dim=-1)
+        posterior_parameters = self.posterior_network(posterior_input)
+        posterior_mean, posterior_standard_deviation = torch.chunk(posterior_parameters, 2, dim=-1)
+        posterior_standard_deviation = torch_functional.softplus(posterior_standard_deviation) + 0.1
+        posterior_distribution = Normal(posterior_mean, posterior_standard_deviation)
+
+        stochastic_state = posterior_distribution.rsample()
+
+        # Kullback-Leibler divergence calculation with free bits constraint
+        kullback_leibler_divergence = torch.distributions.kl.kl_divergence(
+            posterior_distribution, prior_distribution
+        )
+        kullback_leibler_divergence = torch.clamp(
+            kullback_leibler_divergence, min=self.free_bits
+        ).mean()
+
+        updated_state = {
+            'deterministic': deterministic_state,
+            'stochastic': stochastic_state
+        }
+        return updated_state, kullback_leibler_divergence
 
 
-class ContinueModel(nn.Module):
-    """Predict discount/continue (between 0 and 1)."""
-    def __init__(self, feat_dim):
+class RewardPredictor(nn.Module):
+    """Predicts reward values using two-hot encoded targets."""
+    def __init__(self, feature_dimension, number_of_bins=255):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(feat_dim, 256),
+        self.number_of_bins = number_of_bins
+        self.reward_bins = nn.Parameter(
+            torch.linspace(-20, 20, number_of_bins), requires_grad=False
+        )
+        self.network = nn.Sequential(
+            nn.Linear(feature_dimension, 256),
+            nn.ELU(),
+            nn.Linear(256, number_of_bins)
+        )
+
+    def forward(self, feature):
+        return self.network(feature)
+
+
+class ContinuationPredictor(nn.Module):
+    """Predicts episode continuation probability (0-1 range)."""
+    def __init__(self, feature_dimension):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(feature_dimension, 256),
             nn.ELU(),
             nn.Linear(256, 1)
         )
 
-    def forward(self, feat):
-        return torch.sigmoid(self.net(feat))
+    def forward(self, feature):
+        return torch.sigmoid(self.network(feature))
 
 
 class WorldModel(nn.Module):
     """
-    Full Dreamer-style world model:
-      - Encoder
-      - RSSM
-      - Decoder (reconstruction)
-      - RewardModel (twohot)
-      - ContinueModel (if you want discount prediction)
-    Provides:
-      - sequence_loss(...) for multi-step training
-      - rollout_sequence(...) to get latent states from real data
-      - imagine_ahead(...) to produce imaginary trajectories
+    Comprehensive world model architecture integrating components for:
+    - Observation encoding/decoding
+    - Temporal state transitions
+    - Reward prediction
+    - Continuation prediction
     """
-    def __init__(self, obs_dim, action_dim, stoch_dim=32, deter_dim=256, hidden_dim=256, free_bits=1.0):
+    def __init__(self, observation_dimension, action_dimension, 
+                 stochastic_dimension=32, deterministic_dimension=256, 
+                 hidden_dimension=256, free_bits=1.0):
         super().__init__()
-        self.obs_dim = obs_dim
-        self.action_dim = action_dim
-        self.stoch_dim = stoch_dim
-        self.deter_dim = deter_dim
+        self.observation_dimension = observation_dimension
+        self.action_dimension = action_dimension
+        self.stochastic_dimension = stochastic_dimension
+        self.deterministic_dimension = deterministic_dimension
 
-        self.encoder = Encoder(obs_dim, hidden_dim)
-        self.decoder = Decoder(deter_dim + stoch_dim, obs_dim, hidden_dim)
-        self.rssm = GRURSSM(stoch_dim, deter_dim, hidden_dim, free_bits)
+        # Core components initialization
+        self.encoder = Encoder(observation_dimension, hidden_dimension)
+        self.decoder = Decoder(
+            deterministic_dimension + stochastic_dimension, 
+            observation_dimension, 
+            hidden_dimension
+        )
+        self.recurrent_state_space_model = GRURecurrentStateSpaceModel(
+            stochastic_dimension, 
+            deterministic_dimension, 
+            hidden_dimension, 
+            free_bits
+        )
 
-        # For actions, we embed them to match the size used in GRU
-        self.action_embed = nn.Sequential(
-            nn.Linear(action_dim, hidden_dim),
+        # Action processing components
+        self.action_embedder = nn.Sequential(
+            nn.Linear(action_dimension, hidden_dimension),
             nn.ELU()
         )
 
-        # Reward & Continue
-        self.reward_model = RewardModel(deter_dim + stoch_dim)
-        self.continue_model = ContinueModel(deter_dim + stoch_dim)
+        # Predictive components
+        self.reward_predictor = RewardPredictor(deterministic_dimension + stochastic_dimension)
+        self.continuation_predictor = ContinuationPredictor(deterministic_dimension + stochastic_dimension)
 
     def get_initial_state(self, batch_size):
+        """Returns zero-initialized state tensors."""
         return {
-            'deter': torch.zeros(batch_size, self.rssm.deter_dim),
-            'stoch': torch.zeros(batch_size, self.rssm.stoch_dim)
+            'deterministic': torch.zeros(batch_size, self.recurrent_state_space_model.deterministic_dimension),
+            'stochastic': torch.zeros(batch_size, self.recurrent_state_space_model.stochastic_dimension)
         }
 
-    def sequence_loss(self, obs_seq, act_seq, rew_seq, done_seq, free_bits=1.0):
+    def calculate_sequence_loss(self, observation_sequence, action_sequence, 
+                               reward_sequence, termination_sequence):
         """
-        Unroll the RSSM for the entire sequence [B, L].
-        Compute reconstruction, reward, continuation, KL losses.
-        Return a dict of losses. 
+        Computes multi-step losses for world model training.
+        Args:
+            observation_sequence: [batch_size, sequence_length, observation_dimension]
+            action_sequence: [batch_size, sequence_length, action_dimension]
+            reward_sequence: [batch_size, sequence_length]
+            termination_sequence: [batch_size, sequence_length]
+        Returns: Dictionary of component losses and total loss
         """
-        B, L, obs_dim = obs_seq.shape
-        state = self.get_initial_state(B).to(obs_seq.device)
+        batch_size, sequence_length, observation_dimension = observation_sequence.shape
+        current_state = self.get_initial_state(batch_size).to(observation_sequence.device)
 
-        total_kl, total_recon, total_reward, total_cont = 0, 0, 0, 0
+        # Initialize loss accumulators
+        total_divergence = 0.0
+        total_reconstruction = 0.0
+        total_reward_prediction = 0.0
+        total_continuation_prediction = 0.0
 
-        for t in range(L):
-            obs_t = obs_seq[:, t]
-            act_t = act_seq[:, t]
-            rew_t = rew_seq[:, t]
-            done_t= done_seq[:, t]
+        for step in range(sequence_length):
+            current_observation = observation_sequence[:, step]
+            current_action = action_sequence[:, step]
+            current_reward = reward_sequence[:, step]
+            current_termination = termination_sequence[:, step]
 
-            # Encode observation
-            obs_emb = self.encoder(obs_t)
-            # Action embed
-            act_emb = self.action_embed(act_t)
+            # Process inputs
+            encoded_observation = self.encoder(current_observation)
+            encoded_action = self.action_embedder(current_action)
 
-            # RSSM update
-            next_state, kl = self.rssm(state, obs_emb, act_emb)
-            feat = torch.cat([next_state['deter'], next_state['stoch']], dim=-1)
+            # State transition
+            next_state, step_divergence = self.recurrent_state_space_model(
+                current_state, encoded_observation, encoded_action
+            )
+            latent_feature = torch.cat([
+                next_state['deterministic'], 
+                next_state['stochastic']
+            ], dim=-1)
 
-            # Decoder recon
-            recon = self.decoder(feat)
-            recon_loss = F.mse_loss(recon, obs_t)
+            # Reconstruction loss
+            reconstructed_observation = self.decoder(latent_feature)
+            reconstruction_loss = torch_functional.mse_loss(
+                reconstructed_observation, current_observation
+            )
 
-            # Reward (twohot)
-            reward_logits = self.reward_model(feat)
-            # Convert reward to symlog, then twohot
-            rew_symlog = symlog(rew_t)
-            twohot_target = twohot_encode(rew_symlog, self.reward_model.bins)
-            reward_loss = -torch.sum(twohot_target * F.log_softmax(reward_logits, dim=-1), dim=-1).mean()
+            # Reward prediction loss
+            reward_logits = self.reward_predictor(latent_feature)
+            log_transformed_reward = symlog(current_reward)
+            two_hot_targets = twohot_encode(
+                log_transformed_reward, 
+                self.reward_predictor.reward_bins
+            )
+            reward_loss = -torch.sum(
+                two_hot_targets * torch_functional.log_softmax(reward_logits, dim=-1), 
+                dim=-1
+            ).mean()
 
-            # Continue
-            cont_pred = self.continue_model(feat)
-            cont_loss = F.binary_cross_entropy(cont_pred, 1 - done_t.unsqueeze(-1))
+            # Continuation prediction loss
+            continuation_probability = self.continuation_predictor(latent_feature)
+            continuation_loss = torch_functional.binary_cross_entropy(
+                continuation_probability, 
+                1 - current_termination.unsqueeze(-1)
+            )
 
-            total_kl += kl
-            total_recon += recon_loss
-            total_reward += reward_loss
-            total_cont += cont_loss
+            # Update accumulators
+            total_divergence += step_divergence
+            total_reconstruction += reconstruction_loss
+            total_reward_prediction += reward_loss
+            total_continuation_prediction += continuation_loss
 
-            # Move forward
-            state = next_state
+            # Advance state
+            current_state = next_state
 
-        total_kl     /= L
-        total_recon  /= L
-        total_reward /= L
-        total_cont   /= L
+        # Average losses over sequence
+        average_divergence = total_divergence / sequence_length
+        average_reconstruction = total_reconstruction / sequence_length
+        average_reward_prediction = total_reward_prediction / sequence_length
+        average_continuation_prediction = total_continuation_prediction / sequence_length
 
-        total_loss = total_kl + total_recon + total_reward + total_cont
+        combined_loss = (average_divergence + average_reconstruction 
+                        + average_reward_prediction + average_continuation_prediction)
+
         return {
-            'total': total_loss,
-            'kl': total_kl,
-            'recon': total_recon,
-            'reward': total_reward,
-            'cont': total_cont
+            'total_loss': combined_loss,
+            'state_divergence': average_divergence,
+            'reconstruction_loss': average_reconstruction,
+            'reward_prediction_loss': average_reward_prediction,
+            'continuation_prediction_loss': average_continuation_prediction
         }
 
     @torch.no_grad()
-    def rollout_sequence(self, obs_seq, act_seq):
+    def rollout_latent_sequence(self, observation_sequence, action_sequence):
         """
-        Roll out RSSM over a real sequence (obs_seq, act_seq),
-        return the list of final latent features at each time step.
+        Generates latent state sequence from real observations and actions.
+        Returns: List of latent features for each timestep
         """
-        B, L, _ = obs_seq.shape
-        state = self.get_initial_state(B).to(obs_seq.device)
-        feat_seq = []
+        batch_size, sequence_length, _ = observation_sequence.shape
+        current_state = self.get_initial_state(batch_size).to(observation_sequence.device)
+        feature_sequence = []
 
-        for t in range(L):
-            obs_emb = self.encoder(obs_seq[:, t])
-            act_emb = self.action_embed(act_seq[:, t])
-            next_state, _ = self.rssm(state, obs_emb, act_emb)
-            feat = torch.cat([next_state['deter'], next_state['stoch']], dim=-1)
-            feat_seq.append(feat)
-            state = next_state
+        for step in range(sequence_length):
+            encoded_observation = self.encoder(observation_sequence[:, step])
+            encoded_action = self.action_embedder(action_sequence[:, step])
+            next_state, _ = self.recurrent_state_space_model(
+                current_state, encoded_observation, encoded_action
+            )
+            latent_feature = torch.cat([
+                next_state['deterministic'], 
+                next_state['stochastic']
+            ], dim=-1)
+            feature_sequence.append(latent_feature)
+            current_state = next_state
 
-        return feat_seq  # list of length L, each [B, feat_dim]
+        return feature_sequence
 
     @torch.no_grad()
-    def imagine_ahead(self, start_state, actor, horizon, discrete_actions=True):
+    def imagine_trajectory(self, initial_state, behavior_policy, 
+                          prediction_horizon, discrete_actions=True):
         """
-        From a given latent state (deter+stoch),
-        imagine a trajectory for 'horizon' steps by sampling actions from 'actor'.
-        Returns a list of dicts: [{feat, action, reward, cont}, ...].
+        Generates imagined trajectory from initial state using specified policy.
+        Returns: List of predicted states, actions, rewards, and continuations
         """
-        traj = []
-        state = {
-            'deter': start_state['deter'].clone(),
-            'stoch': start_state['stoch'].clone()
+        trajectory = []
+        current_state = {
+            'deterministic': initial_state['deterministic'].clone(),
+            'stochastic': initial_state['stochastic'].clone()
         }
-        B = state['deter'].shape[0]
+        batch_size = current_state['deterministic'].shape[0]
 
-        for t in range(horizon):
-            feat = torch.cat([state['deter'], state['stoch']], dim=-1)
+        for step in range(prediction_horizon):
+            latent_feature = torch.cat([
+                current_state['deterministic'], 
+                current_state['stochastic']
+            ], dim=-1)
 
-            # Sample action from actor
+            # Action selection
             if discrete_actions:
-                logits = actor(feat)
-                dist = torch.distributions.Categorical(logits=logits)
-                action = dist.sample()
-                # One-hot for RSSM
-                action_oh = F.one_hot(action, actor.logits.out_features).float()
-                act_emb = self.action_embed(action_oh)
+                policy_logits = behavior_policy(latent_feature)
+                action_distribution = torch.distributions.Categorical(logits=policy_logits)
+                selected_action = action_distribution.sample()
+                action_representation = torch_functional.one_hot(
+                    selected_action, 
+                    behavior_policy.logits.out_features
+                ).float()
+                encoded_action = self.action_embedder(action_representation)
             else:
-                mu, log_std = actor(feat)
-                std = torch.exp(log_std)
-                dist = torch.distributions.Normal(mu, std)
-                action = dist.sample()
-                act_emb = self.action_embed(action)
+                mean, log_scale = behavior_policy(latent_feature)
+                scale = torch.exp(log_scale)
+                action_distribution = torch.distributions.Normal(mean, scale)
+                selected_action = action_distribution.sample()
+                encoded_action = self.action_embedder(selected_action)
 
-            # RSSM forward (no real obs => we feed 0 or a learned 'phantom' observation embedding)
-            obs_emb = torch.zeros_like(act_emb)  # or a learned phantom param
-            next_state, _ = self.rssm(state, obs_emb, act_emb)
-            next_feat = torch.cat([next_state['deter'], next_state['stoch']], dim=-1)
+            # State prediction
+            phantom_observation = torch.zeros_like(encoded_action)
+            next_state, _ = self.recurrent_state_space_model(
+                current_state, phantom_observation, encoded_action
+            )
+            next_latent_feature = torch.cat([
+                next_state['deterministic'], 
+                next_state['stochastic']
+            ], dim=-1)
 
-            # Predict reward
-            reward_logits = self.reward_model(next_feat)
-            # We can approximate reward by the expected value under two-hot
-            # Or sample. We'll do 'expected reward' by weighting bins
-            probs = F.softmax(reward_logits, dim=-1)
-            bin_values = self.reward_model.bins
-            reward_pred = torch.sum(probs * bin_values, dim=-1)  # shape [B]
+            # Reward prediction
+            reward_logits = self.reward_predictor(next_latent_feature)
+            reward_probabilities = torch_functional.softmax(reward_logits, dim=-1)
+            predicted_reward = torch.sum(
+                reward_probabilities * self.reward_predictor.reward_bins, 
+                dim=-1
+            )
 
-            # Predict discount
-            cont_pred = self.continue_model(next_feat).squeeze(-1)
+            # Continuation prediction
+            continuation_probability = self.continuation_predictor(next_latent_feature).squeeze(-1)
 
-            traj.append({
-                'feat': next_feat,
-                'action': action,   # shape [B]
-                'reward': reward_pred,  # shape [B]
-                'cont': cont_pred       # shape [B]
+            trajectory.append({
+                'latent_feature': next_latent_feature,
+                'selected_action': selected_action,
+                'predicted_reward': predicted_reward,
+                'continuation_probability': continuation_probability
             })
 
-            state = next_state
+            current_state = next_state
 
-        return traj
+        return trajectory

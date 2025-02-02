@@ -1,348 +1,381 @@
 # modules/agent.py
 
-import numpy as np
+import numpy as numpy
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
+import torch.nn as neural_network
+import torch.nn.functional as neural_functional
+import torch.optim as optimization
 
 from .utils import SequenceReplayBuffer, RunningMeanStd
 from .world_model import WorldModel
 
 
-class Actor(nn.Module):
+class BehaviorPolicy(neural_network.Module):
     """
-    - If discrete_actions=True: outputs logits for Categorical dist
-    - If discrete_actions=False: outputs (mu, log_std) for Normal dist
+    Policy network for action selection.
+    - For discrete actions: outputs categorical logits
+    - For continuous actions: outputs mean and log standard deviation for normal distribution
     """
-    def __init__(self, latent_dim, action_dim, discrete_actions=True):
+    def __init__(self, latent_dimension, action_dimension, discrete_actions=True):
         super().__init__()
         self.discrete_actions = discrete_actions
-        hidden = 300
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim, hidden),
-            nn.ELU(),
-            nn.Linear(hidden, hidden),
-            nn.ELU()
+        hidden_units = 300
+        self.network = neural_network.Sequential(
+            neural_network.Linear(latent_dimension, hidden_units),
+            neural_network.ELU(),
+            neural_network.Linear(hidden_units, hidden_units),
+            neural_network.ELU()
         )
         if self.discrete_actions:
-            self.logits = nn.Linear(hidden, action_dim)
+            self.action_logits = neural_network.Linear(hidden_units, action_dimension)
         else:
-            self.mu = nn.Linear(hidden, action_dim)
-            self.log_std = nn.Parameter(torch.zeros(action_dim))
+            self.action_mean = neural_network.Linear(hidden_units, action_dimension)
+            self.log_standard_deviation = neural_network.Parameter(torch.zeros(action_dimension))
 
-    def forward(self, feat):
-        x = self.net(feat)
+    def forward(self, latent_feature):
+        processed_feature = self.network(latent_feature)
         if self.discrete_actions:
-            return self.logits(x)  # [B, action_dim]
+            return self.action_logits(processed_feature)
         else:
-            mu = self.mu(x)
-            log_std = torch.clamp(self.log_std, -5, 2)
-            return mu, log_std
+            mean = self.action_mean(processed_feature)
+            log_std = torch.clamp(self.log_standard_deviation, -5, 2)
+            return mean, log_std
 
 
-class Critic(nn.Module):
-    """Value function approximator."""
-    def __init__(self, latent_dim):
+class StateValueEstimator(neural_network.Module):
+    """Neural network for estimating state values."""
+    def __init__(self, latent_dimension):
         super().__init__()
-        hidden = 300
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim, hidden),
-            nn.ELU(),
-            nn.Linear(hidden, hidden),
-            nn.ELU(),
-            nn.Linear(hidden, 1)
+        hidden_units = 300
+        self.network = neural_network.Sequential(
+            neural_network.Linear(latent_dimension, hidden_units),
+            neural_network.ELU(),
+            neural_network.Linear(hidden_units, hidden_units),
+            neural_network.ELU(),
+            neural_network.Linear(hidden_units, 1)
         )
 
-    def forward(self, feat):
-        return self.net(feat).squeeze(-1)  # [B]
+    def forward(self, latent_feature):
+        return self.network(latent_feature).squeeze(-1)
 
 
-class DreamerAgent:
+class DreamerLearningAgent:
     """
-    Advanced Dreamer-like agent:
-      - Sequence replay
-      - Multi-step RSSM training
-      - Imagination for actor-critic
+    Implements the Dreamer algorithm components:
+    - Experience replay with sequence storage
+    - World model learning
+    - Policy and value function optimization through imagined trajectories
     """
-    def __init__(self,
-                 world_model: WorldModel,
-                 obs_dim: int,
-                 action_dim: int,
-                 discrete_actions: bool = True,
-                 seq_length: int = 50,
-                 buffer_capacity: int = 1000,
-                 batch_size: int = 16,
-                 imagination_horizon: int = 15,
-                 gamma: float = 0.99,
-                 lam: float = 0.95,
-                 free_bits: float = 1.0,
-                 wm_lr: float = 1e-4,
-                 actor_lr: float = 4e-5,
-                 critic_lr: float = 4e-5,
-                 device: str = 'cpu'):
-
-        self.obs_dim = obs_dim
-        self.action_dim = action_dim
+    def __init__(
+        self,
+        world_model: WorldModel,
+        observation_dimension: int,
+        action_dimension: int,
+        discrete_actions: bool = True,
+        sequence_length: int = 50,
+        replay_capacity: int = 1000,
+        training_batch_size: int = 16,
+        imagination_depth: int = 15,
+        discount_factor: float = 0.99,
+        gae_lambda: float = 0.95,
+        free_information_bits: float = 1.0,
+        world_model_learning_rate: float = 1e-4,
+        policy_learning_rate: float = 4e-5,
+        value_learning_rate: float = 4e-5,
+        computation_device: str = 'cpu'
+    ):
+        self.observation_dimension = observation_dimension
+        self.action_dimension = action_dimension
         self.discrete_actions = discrete_actions
-        self.seq_length = seq_length
-        self.batch_size = batch_size
-        self.imagination_horizon = imagination_horizon
-        self.gamma = gamma
-        self.lam = lam
-        self.free_bits = free_bits
-        self.device = device
+        self.sequence_length = sequence_length
+        self.training_batch_size = training_batch_size
+        self.imagination_depth = imagination_depth
+        self.discount_factor = discount_factor
+        self.gae_lambda = gae_lambda
+        self.free_information_bits = free_information_bits
+        self.computation_device = computation_device
 
-        # Replay
-        self.replay_buffer = SequenceReplayBuffer(
-            capacity=buffer_capacity,
-            seq_length=seq_length
+        # Experience replay configuration
+        self.experience_replay = SequenceReplayBuffer(
+            capacity=replay_capacity,
+            sequence_length=sequence_length
         )
 
-        # World Model
-        self.world_model = world_model.to(device)
+        # World model initialization
+        self.world_model = world_model.to(computation_device)
 
-        # Actor & Critic
-        latent_dim = world_model.rssm.deter_dim + world_model.rssm.stoch_dim
-        self.actor = Actor(latent_dim, action_dim, discrete_actions).to(device)
-        self.critic = Critic(latent_dim).to(device)
+        # Policy and value networks
+        latent_feature_size = world_model.recurrent_state_space_model.deterministic_dimension + \
+                            world_model.recurrent_state_space_model.stochastic_dimension
+        self.behavior_policy = BehaviorPolicy(
+            latent_feature_size, 
+            action_dimension, 
+            discrete_actions
+        ).to(computation_device)
+        self.state_value_estimator = StateValueEstimator(latent_feature_size).to(computation_device)
 
-        # Optimizers
-        self.world_opt = optim.Adam(self.world_model.parameters(), lr=wm_lr)
-        self.actor_opt = optim.Adam(self.actor.parameters(), lr=actor_lr)
-        self.critic_opt = optim.Adam(self.critic.parameters(), lr=critic_lr)
+        # Optimization setups
+        self.world_model_optimizer = optimization.Adam(
+            self.world_model.parameters(), 
+            lr=world_model_learning_rate
+        )
+        self.policy_optimizer = optimization.Adam(
+            self.behavior_policy.parameters(), 
+            lr=policy_learning_rate
+        )
+        self.value_optimizer = optimization.Adam(
+            self.state_value_estimator.parameters(), 
+            lr=value_learning_rate
+        )
 
-        # Return Normalization
-        self.ret_rms = RunningMeanStd()
+        # Return normalization
+        self.return_normalizer = RunningMeanStd()
 
-        # Temporary storage for current episode
-        self.ep_obs = []
-        self.ep_actions = []
-        self.ep_rewards = []
-        self.ep_dones = []
+        # Episode tracking
+        self.current_episode_observations = []
+        self.current_episode_actions = []
+        self.current_episode_rewards = []
+        self.current_episode_dones = []
 
-        # Epsilon (for discrete)
-        self.epsilon = 0.10
-        self.epsilon_min = 0.01
-        self.epsilon_decay = 0.999
+        # Exploration parameters
+        self.exploration_rate = 0.10
+        self.minimum_exploration_rate = 0.01
+        self.exploration_decay_factor = 0.999
 
-    def store_transition(self, obs, action, reward, done):
-        self.ep_obs.append(obs)
-        self.ep_actions.append(action)
-        self.ep_rewards.append(reward)
-        self.ep_dones.append(done)
+    def record_experience(self, observation, action, reward, termination):
+        """Store transition data in temporary episode storage."""
+        self.current_episode_observations.append(observation)
+        self.current_episode_actions.append(action)
+        self.current_episode_rewards.append(reward)
+        self.current_episode_dones.append(termination)
 
-        if done:
-            ep_obs = np.array(self.ep_obs, dtype=np.float32)
-            if self.discrete_actions:
-                ep_actions = np.array(self.ep_actions, dtype=np.int32)
-            else:
-                ep_actions = np.array(self.ep_actions, dtype=np.float32)
-            ep_rewards = np.array(self.ep_rewards, dtype=np.float32)
-            ep_dones = np.array(self.ep_dones, dtype=np.float32)
+        if termination:
+            # Convert and store completed episode
+            episode_data = {
+                'observations': numpy.array(self.current_episode_observations, dtype=numpy.float32),
+                'actions': numpy.array(
+                    self.current_episode_actions, 
+                    dtype=numpy.int32 if self.discrete_actions else numpy.float32
+                ),
+                'rewards': numpy.array(self.current_episode_rewards, dtype=numpy.float32),
+                'terminations': numpy.array(self.current_episode_dones, dtype=numpy.float32)
+            }
+            self.experience_replay.store_episode(**episode_data)
 
-            self.replay_buffer.store_episode(ep_obs, ep_actions, ep_rewards, ep_dones)
-
-            self.ep_obs.clear()
-            self.ep_actions.clear()
-            self.ep_rewards.clear()
-            self.ep_dones.clear()
+            # Reset episode storage
+            self.current_episode_observations.clear()
+            self.current_episode_actions.clear()
+            self.current_episode_rewards.clear()
+            self.current_episode_dones.clear()
 
     @torch.no_grad()
-    def act(self, obs, epsilon=None):
+    def select_action(self, observation, exploration_rate=None):
         """
-        Single-step action for environment. 
-        If discrete: do an epsilon-greedy w.r.t. the actor's logits
-        If continuous: sample from Normal, optionally add exploration noise.
+        Selects an action using current policy with exploration.
+        Returns:
+            - Discrete action index or continuous action vector
         """
-        if epsilon is None:
-            epsilon = self.epsilon
-        obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+        current_exploration_rate = exploration_rate or self.exploration_rate
+        observation_tensor = torch.FloatTensor(observation).unsqueeze(0).to(self.computation_device)
 
-        # Minimal encoding
+        # Feature extraction
         if hasattr(self.world_model, 'encoder'):
-            obs_emb = self.world_model.encoder(obs_tensor)
-            # For a single-step approach, no real state update, just use obs_emb
-            # Or skip if you prefer direct obs as input
-            feat = obs_emb
+            encoded_observation = self.world_model.encoder(observation_tensor)
+            policy_input = encoded_observation
         else:
-            feat = obs_tensor
+            policy_input = observation_tensor
 
+        # Action selection logic
         if self.discrete_actions:
-            logits = self.actor(feat)
-            if np.random.rand() < epsilon:
-                action = np.random.randint(0, self.action_dim)
+            action_logits = self.behavior_policy(policy_input)
+            if numpy.random.uniform() < current_exploration_rate:
+                selected_action = numpy.random.randint(self.action_dimension)
             else:
-                dist = torch.distributions.Categorical(logits=logits)
-                action = dist.sample().item()
-            return action
+                action_distribution = torch.distributions.Categorical(logits=action_logits)
+                selected_action = action_distribution.sample().item()
+            return selected_action
         else:
-            mu, log_std = self.actor(feat)
-            std = torch.exp(log_std)
-            dist = torch.distributions.Normal(mu, std)
-            action = dist.sample()
-            return action.squeeze(0).cpu().numpy()
+            action_mean, action_log_std = self.behavior_policy(policy_input)
+            action_std = torch.exp(action_log_std)
+            action_distribution = torch.distributions.Normal(action_mean, action_std)
+            return action_distribution.sample().squeeze(0).cpu().numpy()
 
-    def train(self):
+    def update_models(self):
         """
-        Overall training step:
-          1) Train world model
-          2) Train actor-critic with imagination
-          3) Update epsilon
+        Orchestrates the training process:
+        1. Updates world model parameters
+        2. Optimizes policy and value functions
+        3. Adjusts exploration rate
         """
-        if len(self.replay_buffer) < 5:
+        if len(self.experience_replay) < 5:
             return {}
 
-        wm_logs = self.train_world_model()
-        ac_logs = self.train_actor_critic()
+        world_model_metrics = self.update_world_model()
+        policy_value_metrics = self.update_policy_and_value()
 
-        # Update epsilon (for discrete envs)
+        # Gradually reduce exploration rate
         if self.discrete_actions:
-            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+            self.exploration_rate = max(
+                self.minimum_exploration_rate,
+                self.exploration_rate * self.exploration_decay_factor
+            )
 
-        logs = {**wm_logs, **ac_logs}
-        return logs
+        return {**world_model_metrics, **policy_value_metrics}
 
-    def train_world_model(self):
-        """
-        1) Sample sequences
-        2) Compute sequence loss with self.world_model.sequence_loss
-        3) Backprop + clip
-        """
-        obs_seq, act_seq, rew_seq, done_seq = self.replay_buffer.sample(self.batch_size)
-        obs_seq   = obs_seq.to(self.device)  # [B, L, obs_dim]
-        act_seq   = act_seq.to(self.device)  # [B, L]
-        rew_seq   = rew_seq.to(self.device)
-        done_seq  = done_seq.to(self.device)
+    def update_world_model(self):
+        """Executes world model training step using sampled sequences."""
+        batch_data = self.experience_replay.sample(self.training_batch_size)
+        observation_sequence = batch_data['observations'].to(self.computation_device)
+        action_sequence = batch_data['actions'].to(self.computation_device)
+        reward_sequence = batch_data['rewards'].to(self.computation_device)
+        termination_sequence = batch_data['terminations'].to(self.computation_device)
 
-        # Convert discrete actions -> one-hot
-        if self.discrete_actions and act_seq.ndim == 2:
-            act_seq_oh = F.one_hot(act_seq.long(), self.action_dim).float()
+        # Convert discrete actions to one-hot encoding
+        if self.discrete_actions and action_sequence.ndim == 2:
+            action_representation = neural_functional.one_hot(
+                action_sequence.long(), 
+                self.action_dimension
+            ).float()
         else:
-            act_seq_oh = act_seq
+            action_representation = action_sequence
 
-        wm_loss_dict = self.world_model.sequence_loss(obs_seq, act_seq_oh, rew_seq, done_seq, self.free_bits)
+        # Calculate world model losses
+        model_losses = self.world_model.calculate_sequence_loss(
+            observation_sequence,
+            action_representation,
+            reward_sequence,
+            termination_sequence,
+            self.free_information_bits
+        )
 
-        self.world_opt.zero_grad()
-        wm_loss_dict['total'].backward()
-        nn.utils.clip_grad_norm_(self.world_model.parameters(), 100.0)
-        self.world_opt.step()
+        # Optimization step
+        self.world_model_optimizer.zero_grad()
+        model_losses['total_loss'].backward()
+        neural_network.utils.clip_grad_norm_(self.world_model.parameters(), 100.0)
+        self.world_model_optimizer.step()
 
-        # Return logs
         return {
-            'wm_total': wm_loss_dict['total'].item(),
-            'wm_kl': wm_loss_dict['kl'].item(),
-            'wm_recon': wm_loss_dict['recon'].item(),
-            'wm_reward': wm_loss_dict['reward'].item(),
-            'wm_cont': wm_loss_dict['cont'].item() if 'cont' in wm_loss_dict else 0.0
+            'world_model_total_loss': model_losses['total_loss'].item(),
+            'state_divergence_loss': model_losses['state_divergence'].item(),
+            'observation_reconstruction_loss': model_losses['reconstruction_loss'].item(),
+            'reward_prediction_loss': model_losses['reward_prediction_loss'].item(),
+            'continuation_prediction_loss': model_losses.get('continuation_prediction_loss', 0.0)
         }
 
-    def train_actor_critic(self):
-        """
-        1) Sample sequences (unroll real data in RSSM)
-        2) Take final latent -> imagine ahead
-        3) Compute returns with GAE-lambda or n-step
-        4) Optimize actor & critic
-        """
-        obs_seq, act_seq, rew_seq, done_seq = self.replay_buffer.sample(self.batch_size)
-        obs_seq   = obs_seq.to(self.device)
-        act_seq   = act_seq.to(self.device)
-        rew_seq   = rew_seq.to(self.device)
-        done_seq  = done_seq.to(self.device)
+    def update_policy_and_value(self):
+        """Optimizes policy and value networks using imagined trajectories."""
+        batch_data = self.experience_replay.sample(self.training_batch_size)
+        observation_sequence = batch_data['observations'].to(self.computation_device)
+        action_sequence = batch_data['actions'].to(self.computation_device)
 
-        if self.discrete_actions and act_seq.ndim == 2:
-            act_seq_oh = F.one_hot(act_seq.long(), self.action_dim).float()
+        # Convert action representation if needed
+        if self.discrete_actions and action_sequence.ndim == 2:
+            action_representation = neural_functional.one_hot(
+                action_sequence.long(), 
+                self.action_dimension
+            ).float()
         else:
-            act_seq_oh = act_seq
+            action_representation = action_sequence
 
-        # 1) Get final latent from real data unroll
+        # Extract final latent state from real sequence
         with torch.no_grad():
-            feat_seq = self.world_model.rollout_sequence(obs_seq, act_seq_oh)
-            final_feat = feat_seq[-1]  # [B, feat_dim]
-
-            final_state = {
-                'deter': final_feat[:, :self.world_model.rssm.deter_dim],
-                'stoch': final_feat[:, self.world_model.rssm.deter_dim:]
+            latent_sequence = self.world_model.rollout_latent_sequence(
+                observation_sequence, 
+                action_representation
+            )
+            final_latent_state = {
+                'deterministic': latent_sequence[-1][:, :self.world_model.recurrent_state_space_model.deterministic_dimension],
+                'stochastic': latent_sequence[-1][:, self.world_model.recurrent_state_space_model.deterministic_dimension:]
             }
 
-        # 2) Imagination
-        imagined_traj = self.world_model.imagine_ahead(final_state, self.actor, self.imagination_horizon, self.discrete_actions)
-        # Each element: { feat, action, reward, cont }
+        # Generate imagined trajectory
+        imagined_rollout = self.world_model.imagine_trajectory(
+            final_latent_state,
+            self.behavior_policy,
+            self.imagination_depth,
+            self.discrete_actions
+        )
 
-        # 3) Critic values & GAE-lambda returns
-        for step in imagined_traj:
-            step['value'] = self.critic(step['feat'])
+        # Calculate value estimates and advantages
+        for time_step in imagined_rollout:
+            time_step['value_estimate'] = self.state_value_estimator(time_step['latent_feature'])
+        
+        imagined_returns, advantage_estimates = self.calculate_gae_returns(imagined_rollout)
 
-        returns, advantages = self.compute_gae(imagined_traj)
-
-        # 4a) Actor update
-        actor_loss = 0.0
-        for t, step_data in enumerate(imagined_traj):
-            feat = step_data['feat']
-            action = step_data['action']
-            advantage = advantages[t].detach()
-
+        # Policy optimization
+        policy_loss = torch.tensor(0.0, device=self.computation_device)
+        for step_data, advantage in zip(imagined_rollout, advantage_estimates):
+            latent_feature = step_data['latent_feature']
+            selected_action = step_data['selected_action']
+            
             if self.discrete_actions:
-                logits = self.actor(feat)
-                dist = torch.distributions.Categorical(logits=logits)
-                logp = dist.log_prob(action)
+                action_logits = self.behavior_policy(latent_feature)
+                action_distribution = torch.distributions.Categorical(logits=action_logits)
+                log_probability = action_distribution.log_prob(selected_action)
             else:
-                mu, log_std = self.actor(feat)
-                std = torch.exp(log_std)
-                dist = torch.distributions.Normal(mu, std)
-                # action shape: [B, action_dim]
-                logp = dist.log_prob(action).sum(dim=-1)
+                action_mean, action_log_std = self.behavior_policy(latent_feature)
+                action_std = torch.exp(action_log_std)
+                action_distribution = torch.distributions.Normal(action_mean, action_std)
+                log_probability = action_distribution.log_prob(selected_action).sum(dim=-1)
 
-            actor_loss -= (logp * advantage).mean()
+            policy_loss -= (log_probability * advantage.detach()).mean()
 
-        self.actor_opt.zero_grad()
-        actor_loss.backward()
-        nn.utils.clip_grad_norm_(self.actor.parameters(), 100.0)
-        self.actor_opt.step()
+        self.policy_optimizer.zero_grad()
+        policy_loss.backward()
+        neural_network.utils.clip_grad_norm_(self.behavior_policy.parameters(), 100.0)
+        self.policy_optimizer.step()
 
-        # 4b) Critic update
-        critic_loss = 0.0
-        for t, step_data in enumerate(imagined_traj):
-            value_pred = step_data['value']
-            target = returns[t].detach()
-            critic_loss += F.mse_loss(value_pred, target)
+        # Value function optimization
+        value_loss = torch.tensor(0.0, device=self.computation_device)
+        for step_data, target_return in zip(imagined_rollout, imagined_returns):
+            predicted_value = step_data['value_estimate']
+            value_loss += neural_functional.mse_loss(predicted_value, target_return.detach())
 
-        critic_loss /= len(imagined_traj)  # average across horizon
+        value_loss /= len(imagined_rollout)
 
-        self.critic_opt.zero_grad()
-        critic_loss.backward()
-        nn.utils.clip_grad_norm_(self.critic.parameters(), 100.0)
-        self.critic_opt.step()
+        self.value_optimizer.zero_grad()
+        value_loss.backward()
+        neural_network.utils.clip_grad_norm_(self.state_value_estimator.parameters(), 100.0)
+        self.value_optimizer.step()
 
         return {
-            'actor_loss': actor_loss.item(),
-            'critic_loss': critic_loss.item()
+            'policy_improvement_loss': policy_loss.item(),
+            'value_estimation_loss': value_loss.item()
         }
 
-    def compute_gae(self, traj):
+    def calculate_gae_returns(self, trajectory):
         """
-        Compute λ-returns (GAE) for the imagined trajectory.
-        traj is a list of dicts with keys: feat, action, reward, cont, value
+        Computes Generalized Advantage Estimation (GAE) returns.
+        Args:
+            trajectory: List of dictionaries containing:
+                - reward: Immediate reward
+                - continuation_probability: Episode continuation probability
+                - value_estimate: Predicted state value
+        Returns:
+            Tuple of (returns, advantages) for each timestep
         """
-        horizon = len(traj)
-        returns = [None] * horizon
-        advantages = [None] * horizon
+        trajectory_length = len(trajectory)
+        calculated_returns = [None] * trajectory_length
+        calculated_advantages = [None] * trajectory_length
 
-        next_value = traj[-1]['value'].detach()
-        next_adv = torch.zeros_like(next_value)
+        next_value = trajectory[-1]['value_estimate'].detach()
+        next_advantage = torch.zeros_like(next_value)
 
-        for t in reversed(range(horizon)):
-            reward = traj[t]['reward']  # shape [B]
-            cont   = traj[t]['cont'] * self.gamma
-            value  = traj[t]['value']
-            delta = reward + cont * next_value - value
-            adv = delta + cont * self.lam * next_adv
-            ret = value + adv
+        # Reverse temporal processing
+        for time_step in reversed(range(trajectory_length)):
+            current_reward = trajectory[time_step]['reward']
+            continuation = trajectory[time_step]['continuation_probability'] * self.discount_factor
+            current_value = trajectory[time_step]['value_estimate']
+            
+            temporal_difference = current_reward + continuation * next_value - current_value
+            advantage_estimate = temporal_difference + continuation * self.gae_lambda * next_advantage
+            return_estimate = current_value + advantage_estimate
 
-            returns[t] = ret
-            advantages[t] = adv
+            calculated_returns[time_step] = return_estimate
+            calculated_advantages[time_step] = advantage_estimate
 
-            next_value = value.detach()
-            next_adv = adv.detach()
+            # Update carryover values
+            next_value = current_value.detach()
+            next_advantage = advantage_estimate.detach()
 
-        return returns, advantages
+        return calculated_returns, calculated_advantages
